@@ -1,0 +1,22 @@
+# .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+.vscode/
+.idea/
+
+# NuGet
+*.nupkg
+*.snupkg
+nupkg/
+artifacts/
+
+# Native build outputs
+build/
+src/UtpStream/runtimes/
+
+# OS
+.DS_Store
+Thumbs.db
