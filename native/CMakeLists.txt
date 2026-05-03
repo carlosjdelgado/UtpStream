@@ -41,11 +41,13 @@ endif()
 # Output: libutp.so on Linux, libutp.dylib on macOS, utp.dll on Windows
 set_target_properties(utp PROPERTIES OUTPUT_NAME utp)
 
+option(BUILD_TOOLS "Build ucat and native_bench (host-only utilities)" ON)
+
 # Reference CLIs (ucat) and the bench binary are POSIX-only and only useful
-# on the build host — when we cross-compile (e.g. to linux-arm for Raspberry
-# Pi), skip them, since they'd produce binaries we can't run on the CI
-# runner anyway.
-if(NOT WIN32 AND NOT CMAKE_CROSSCOMPILING)
+# on the build host — when we cross-compile (linux-arm, or macOS x86_64
+# from an Apple Silicon runner), skip them: they'd produce binaries we
+# can't run on the host anyway. CI passes -DBUILD_TOOLS=OFF.
+if(NOT WIN32 AND NOT CMAKE_CROSSCOMPILING AND BUILD_TOOLS)
     # ucat — libutp's reference netcat-style CLI.
     add_executable(ucat libutp/ucat.c)
     target_link_libraries(ucat PRIVATE utp)
