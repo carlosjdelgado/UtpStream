@@ -134,7 +134,7 @@ for size_mib in "${SIZES_MIB[@]}"; do
     m_avg=$(avg "${MRATES[@]}");  m_min=$(minv "${MRATES[@]}");  m_max=$(maxv "${MRATES[@]}")
     ratio=$(awk -v m="$m_avg" -v n="$n_avg" 'BEGIN { if (n > 0) printf "%.0f%%", m * 100 / n; else print "—" }')
 
-    printf "| **%4d MiB** | %s (%s – %s) | %s (%s – %s) | %s |\n" \
+    printf "| **%d MiB** | %s (%s – %s) | %s (%s – %s) | %s |\n" \
         "$size_mib" "$n_avg" "$n_min" "$n_max" "$m_avg" "$m_min" "$m_max" "$ratio" \
         >> "$OUT"
 done
