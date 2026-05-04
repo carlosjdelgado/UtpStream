@@ -10,6 +10,7 @@
     <Product>UtpStream</Product>
     <Description>µTP (Micro Transport Protocol) streams for .NET — a Stream/Socket API on top of libutp.</Description>
     <PackageTags>utp;µtp;bittorrent;udp;networking;transport;libutp</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <RepositoryUrl>https://github.com/carlosjdelgado/UtpStream</RepositoryUrl>
     <RepositoryType>git</RepositoryType>

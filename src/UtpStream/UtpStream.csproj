@@ -16,6 +16,10 @@
     <InternalsVisibleTo Include="UtpStream.Tests" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
   <!--
     Native binaries live under runtimes/<rid>/native/. CI populates these
     from artifacts produced by native CMake jobs across all supported RIDs.
