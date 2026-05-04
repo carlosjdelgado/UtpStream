@@ -9,11 +9,11 @@ using UtpStream.Internal;
 namespace UtpStream;
 
 /// <summary>
-/// A µTP socket — analogous to <see cref="System.Net.Sockets.Socket"/> but
+/// A µTP socket — analogous to <see cref="Socket"/> but
 /// over the µTP/UDP protocol. Use <see cref="ConnectAsync"/> to dial an
 /// endpoint, or obtain one from <see cref="UtpListener.AcceptAsync"/>.
 /// Wrap with <see cref="GetStream"/> to do reads/writes via a
-/// <see cref="System.IO.Stream"/>.
+/// <see cref="Stream"/>.
 /// </summary>
 public sealed class UtpSocket : IDisposable
 {
@@ -24,8 +24,17 @@ public sealed class UtpSocket : IDisposable
     // Receive path is hot: every datagram libutp hands us turns into one
     // RxChunk. We rent the backing array from ArrayPool so we don't churn
     // the GC under sustained transfer.
+    // SingleWriter = true: OnRead is only ever called from the pump thread
+    // (inside libutp callbacks). Combined with SingleReader, .NET switches
+    // to SingleProducerSingleConsumerQueue internally — a segmented ring
+    // buffer that allocates in chunks of 32 slots instead of one linked-list
+    // node per datagram, eliminating per-datagram allocation on the hot path.
     private readonly Channel<RxChunk> _rx =
-        Channel.CreateUnbounded<RxChunk>(new UnboundedChannelOptions { SingleReader = true });
+        Channel.CreateUnbounded<RxChunk>(new UnboundedChannelOptions
+        {
+            SingleReader = true,
+            SingleWriter = true,
+        });
     private readonly Queue<PendingWrite> _writeQueue = new();
     // Concurrent inbox for new writes — touched by callers from any
     // thread. The pump drains this on each iteration without paying for
@@ -154,7 +163,7 @@ public sealed class UtpSocket : IDisposable
         }
     }
 
-    /// <summary>Wrap this socket in a <see cref="System.IO.Stream"/>.</summary>
+    /// <summary>Wrap this socket in a <see cref="Stream"/>.</summary>
     public UtpStream GetStream() => new(this);
 
     // ----- inbound (called by UtpContext callbacks on the pump thread) -----
@@ -230,21 +239,38 @@ public sealed class UtpSocket : IDisposable
             _hasRxCurrent = true;
         }
 
-        int n = Math.Min(buffer.Length, _rxCurrent.Length);
-        _rxCurrent.Buffer.AsSpan(_rxCurrent.Offset, n).CopyTo(buffer.Span);
-        Interlocked.Add(ref _bufferedBytes, -n);
-
-        if (n == _rxCurrent.Length)
+        // Drain as many buffered chunks as fit in the caller's buffer without
+        // blocking. A single libutp datagram is ~1400 bytes; a typical
+        // ReadAsync buffer is 64 KiB+, so we absorb ~46 chunks per call
+        // instead of doing 46 round-trips through the async state machine.
+        int total = 0;
+        while (buffer.Length > 0)
         {
+            int n = Math.Min(buffer.Length, _rxCurrent.Length);
+            _rxCurrent.Buffer.AsSpan(_rxCurrent.Offset, n).CopyTo(buffer.Span);
+            Interlocked.Add(ref _bufferedBytes, -n);
+            total += n;
+
+            if (n < _rxCurrent.Length)
+            {
+                // Caller's buffer is full; leave the remainder for next call.
+                _rxCurrent.Offset += n;
+                _rxCurrent.Length -= n;
+                break;
+            }
+
+            // Current chunk fully consumed — return its buffer to the pool.
             ArrayPool<byte>.Shared.Return(_rxCurrent.Buffer);
             _hasRxCurrent = false;
+            buffer = buffer[n..];
+
+            // Try to grab the next chunk synchronously. Stop if the channel
+            // is empty — caller will await again on the next ReadAsync.
+            if (!_rx.Reader.TryRead(out _rxCurrent))
+                break;
+            _hasRxCurrent = true;
         }
-        else
-        {
-            _rxCurrent.Offset += n;
-            _rxCurrent.Length -= n;
-        }
-        return n;
+        return total;
     }
 
     // ----- write path (used by UtpStream) -----
@@ -355,7 +381,7 @@ public sealed class UtpSocket : IDisposable
         }
         else
         {
-            using var pin = pending.Data.Slice(pending.Offset).Pin();
+            using var pin = pending.Data[pending.Offset..].Pin();
             written = LibUtp.utp_write(NativeHandle, (nint)pin.Pointer, (nuint)len);
         }
 
