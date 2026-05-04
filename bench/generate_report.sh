@@ -2,7 +2,17 @@
 # Run the throughput benchmark for several payload sizes and emit a
 # Markdown report at bench/RESULTS.md. Re-run any time to refresh.
 #
-# Usage: bench/generate_report.sh
+# Usage: bench/generate_report.sh [--latency=<delay>]
+#
+#   --latency=<delay>   Apply artificial loopback RTT via tc netem to
+#                       stabilise LEDBAT's congestion control. No sudo needed:
+#                       the script re-execs itself inside a private network
+#                       namespace (unshare -rn) where your user appears as
+#                       root and tc works without real privileges.
+#                       Example: --latency=5ms
+#                       Without this flag the loopback RTT is ~0 µs, which
+#                       causes LEDBAT to oscillate between fast and slow modes
+#                       and makes native vs managed comparisons unreliable.
 
 set -uo pipefail
 export LC_ALL=C
@@ -14,7 +24,15 @@ MANAGED_BIN="$ROOT/bench/UtpStreamBench/bin/Release/net10.0/UtpStreamBench"
 OUT="$ROOT/bench/RESULTS.md"
 
 SIZES_MIB=(100 300 500 800 1024)
-ITERATIONS=5
+ITERATIONS=20
+LATENCY="5ms"
+
+for arg in "$@"; do
+    case "$arg" in
+        --latency=*) LATENCY="${arg#--latency=}" ;;
+        *) echo "unknown argument: $arg" >&2; exit 1 ;;
+    esac
+done
 
 if [[ ! -x "$NATIVE_BIN" ]]; then
     echo "error: native_bench not built — run 'cmake --build build --config Release'" >&2
@@ -23,6 +41,20 @@ fi
 if [[ ! -x "$MANAGED_BIN" ]]; then
     echo "error: managed bench not built — run 'dotnet build bench/UtpStreamBench -c Release'" >&2
     exit 1
+fi
+
+# Apply artificial loopback latency to stabilise LEDBAT's congestion control.
+# We use unshare -rn to get a private network namespace where the current user
+# maps to UID 0, so tc netem works without real root. The namespace — and the
+# netem config — disappear automatically when the script exits. No cleanup trap
+# needed and the host loopback is never touched.
+if [[ -n "$LATENCY" && -z "${_UTPBENCH_NETNS:-}" ]]; then
+    echo "Applying loopback latency: $LATENCY (unshare netns, no sudo)" >&2
+    exec env _UTPBENCH_NETNS=1 unshare -rn bash -- "${BASH_SOURCE[0]}" "$@"
+fi
+if [[ -n "$LATENCY" && -n "${_UTPBENCH_NETNS:-}" ]]; then
+    ip link set lo up
+    tc qdisc add dev lo root netem delay "$LATENCY"
 fi
 
 run_one() {
@@ -91,6 +123,9 @@ GIT_REV=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo "(uncommitte
     echo "| UtpStream rev | \`$GIT_REV\` |"
     echo "| libutp rev | \`$LIBUTP_REV\` |"
     echo "| Iterations per size | $ITERATIONS |"
+    if [[ -n "$LATENCY" ]]; then
+        echo "| Loopback latency (unshare + tc netem) | $LATENCY |"
+    fi
     echo
     echo "## Results"
     echo
@@ -105,10 +140,10 @@ for size_mib in "${SIZES_MIB[@]}"; do
     echo "── ${size_mib} MiB ──" >&2
 
     declare -a NRATES=() MRATES=()
-    # Run all native iterations together then all managed, with a cooldown
-    # between runs. Interleaving them gave noisy means because GC / thermal
-    # state on one side leaked into the other's run; a 2 s gap also lets
-    # the kernel reclaim ephemeral ports and buffer pages between runs.
+    # Interleave native/managed pairs so both measurements see the same
+    # LEDBAT congestion-control state. Running all native first then all
+    # managed means the CC warms up differently for each, making the ratio
+    # unreliable. Pairs share the same protocol epoch.
     for i in $(seq 1 "$ITERATIONS"); do
         sleep 2
         echo "  native iter $i..." >&2
@@ -118,8 +153,7 @@ for size_mib in "${SIZES_MIB[@]}"; do
         else
             echo "    -> SKIPPED (timeout/error)" >&2
         fi
-    done
-    for i in $(seq 1 "$ITERATIONS"); do
+
         sleep 2
         echo "  managed iter $i..." >&2
         rate=$(run_one managed "$size_bytes")
@@ -151,13 +185,15 @@ done
     echo '# Build managed bench tool'
     echo 'dotnet build bench/UtpStreamBench/UtpStreamBench.csproj -c Release'
     echo
-    echo '# Regenerate this report'
-    echo 'bench/generate_report.sh'
+    echo '# Regenerate this report (add --latency=5ms for stable LEDBAT conditions)'
+    echo 'bench/generate_report.sh [--latency=<delay>]'
     echo '```'
     echo
     echo "_Numbers fluctuate run-to-run with kernel scheduling, GC and µTP's"
     echo "delay-based congestion control — the relative ratio is the meaningful"
-    echo "figure, not the absolute MiB/s._"
+    echo "figure, not the absolute MiB/s. Pass \`--latency=5ms\` to apply an"
+    echo "artificial loopback RTT via \`tc netem\` (no sudo — uses \`unshare -rn\`)"
+    echo "and get a more stable baseline._"
 } >> "$OUT"
 
 echo >&2

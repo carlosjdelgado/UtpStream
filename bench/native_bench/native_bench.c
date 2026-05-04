@@ -50,6 +50,7 @@ typedef struct {
 
     /* receiver state */
     size_t recv_total;
+    size_t recv_skip;   /* start timing after this many bytes received */
     size_t recv_target;
     int finished;
 
@@ -62,10 +63,16 @@ static double now_sec(void) {
     return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
-/* Timing window: covers only the data-transfer phase. Set when the sender
-   sees UTP_STATE_CONNECT (handshake done) and stopped when the receiver
-   hits the byte target — same window the .NET bench measures. Written
-   once each, read after pthread_join so no atomics needed. */
+/* Fraction of bytes to skip at the start before beginning timing.
+   Both benchmarks start the clock from the receiver's perspective once
+   this threshold is crossed, discarding the LEDBAT slow-start phase and
+   measuring only steady-state throughput. */
+#define SKIP_FRAC 0.20
+
+/* Timing window: started by the receiver once SKIP_FRAC of the bytes have
+   arrived (steady-state begins), stopped when the full target is reached.
+   Written once each from the receiver thread, read by main after join —
+   no atomics needed. */
 static double g_t_start = 0;
 static double g_t_end   = 0;
 
@@ -111,7 +118,6 @@ static unsigned long long sender_cb_state_change(utp_callback_arguments *a) {
         case UTP_STATE_CONNECT:
             ep->connected = 1;
             ep->writable = 1;
-            if (g_t_start == 0) g_t_start = now_sec();
             sender_pump_writes(ep);
             break;
         case UTP_STATE_WRITABLE:
@@ -168,6 +174,9 @@ static unsigned long long receiver_cb_on_read(utp_callback_arguments *a) {
     }
 
     ep->recv_total += a->len;
+    /* Start the steady-state timer once the skip threshold is crossed. */
+    if (g_t_start == 0 && ep->recv_total >= ep->recv_skip)
+        g_t_start = now_sec();
     utp_read_drained(a->socket);
     if (ep->recv_total >= ep->recv_target && ep->sock && !ep->finished) {
         if (g_t_end == 0) g_t_end = now_sec();
@@ -289,6 +298,7 @@ int main(int argc, char **argv) {
     /* Receiver endpoint: bind ephemeral, listen for incoming. */
     endpoint_t recv_ep = {0};
     pthread_mutex_init(&recv_ep.mu, NULL);
+    recv_ep.recv_skip   = (size_t)((double)total * SKIP_FRAC);
     recv_ep.recv_target = total;
     recv_ep.fd = setup_udp(0); /* ephemeral */
     recv_ep.ctx = setup_ctx(&recv_ep, /*listener=*/1);
@@ -328,13 +338,14 @@ int main(int argc, char **argv) {
     pthread_join(send_th, NULL);
     pthread_join(recv_th, NULL);
 
-    /* Report only the data-transfer window (UTP_STATE_CONNECT → target
-       reached) so this is comparable to UtpStreamBench, which clocks
-       only the WriteAsync/ReadAsync phase. */
+    /* Report only the steady-state window: bytes received after the skip
+       threshold, timed from the same receiver-side perspective as the
+       managed benchmark. */
+    size_t steady_bytes = recv_ep.recv_total - recv_ep.recv_skip;
     double secs = g_t_end - g_t_start;
-    double mibps = (double)recv_ep.recv_total / 1048576.0 / secs;
+    double mibps = (double)steady_bytes / 1048576.0 / secs;
     printf("native: received %zu bytes in %.2f s (%.2f MiB/s)\n",
-           recv_ep.recv_total, secs, mibps);
+           steady_bytes, secs, mibps);
 
     free(payload);
     return recv_ep.recv_total == total ? 0 : 1;

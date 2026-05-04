@@ -4,6 +4,13 @@ using UtpStream;
 
 // Single-process throughput benchmark with diagnostic tracing.
 // Set BENCH_TRACE=1 to get per-second progress dumps to stderr.
+//
+// Throughput is measured over the final (1 - SKIP_FRAC) of the transfer,
+// starting the clock from the receiver's perspective once SKIP_FRAC bytes
+// have arrived. This discards the LEDBAT slow-start phase and reports only
+// the steady-state window, mirroring native_bench's measurement approach.
+
+const double SkipFrac = 0.20;
 
 if (args.Length < 1)
 {
@@ -38,54 +45,44 @@ await using var serverStream = server.GetStream();
 var payload = new byte[total];
 TraceLine($"payload allocated ({total / 1048576} MiB)");
 
-long bytesSentReturned = 0;
-long bytesReceived = 0;
-
-var sw = Stopwatch.StartNew();
-
 var sendTask = Task.Run(async () =>
 {
     TraceLine("sender: WriteAsync starting");
     await clientStream.WriteAsync(payload);
     TraceLine("sender: WriteAsync returned");
-    Interlocked.Exchange(ref bytesSentReturned, payload.Length);
 });
+
+long skipBytes = (long)(total * SkipFrac);
 
 var recvTask = Task.Run(async () =>
 {
     var buf = new byte[64 * 1024];
+    var sw = new Stopwatch();
     long got = 0;
+
     while (got < total)
     {
         int n = await serverStream.ReadAsync(buf);
         if (n <= 0) break;
         got += n;
-        Interlocked.Exchange(ref bytesReceived, got);
-    }
-    TraceLine($"receiver: done, got={got}");
-    return got;
-});
 
-// Trace heartbeat (only fires if BENCH_TRACE=1)
-var monitorCts = new CancellationTokenSource();
-var monitorTask = trace ? Task.Run(async () =>
-{
-    while (!monitorCts.Token.IsCancellationRequested)
-    {
-        try { await Task.Delay(1000, monitorCts.Token); } catch { break; }
-        TraceLine($"heartbeat: sent_returned={Volatile.Read(ref bytesSentReturned):N0} received={Volatile.Read(ref bytesReceived):N0}");
+        // Start timing once we've crossed the skip threshold — the CC
+        // has had enough time to leave slow-start and reach steady state.
+        if (!sw.IsRunning && got >= skipBytes)
+            sw.Start();
     }
-}) : Task.CompletedTask;
+
+    sw.Stop();
+    TraceLine($"receiver: done, got={got}");
+    return (Bytes: got - skipBytes, Elapsed: sw.Elapsed.TotalSeconds);
+});
 
 await sendTask;
 TraceLine("await sendTask done");
-var received = await recvTask;
+var (steadyBytes, secs) = await recvTask;
 TraceLine("await recvTask done");
-sw.Stop();
-monitorCts.Cancel();
-try { await monitorTask; } catch { }
 
+double mibps = steadyBytes / secs / (1024.0 * 1024.0);
 Console.WriteLine(
-    $"managed: received {received:N0} bytes in {sw.Elapsed.TotalSeconds:F2} s " +
-    $"({received / sw.Elapsed.TotalSeconds / (1024.0 * 1024.0):F2} MiB/s)");
-return received == total ? 0 : 1;
+    $"managed: received {steadyBytes:N0} bytes in {secs:F2} s ({mibps:F2} MiB/s)");
+return steadyBytes > 0 ? 0 : 1;
